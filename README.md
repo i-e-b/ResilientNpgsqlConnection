@@ -13,7 +13,7 @@ var connStr = @"Server=127.0.0.1;Port=26299;Database=testdb;User Id=root;...";
 using var conn = new ResilientConnection(connStr);
 
 
-var result = subject.Query<string>("SELECT ...")...
+var result = conn.Query<string>("SELECT ...")...
 ```
 
 ## Use as wrapper around an existing connection
