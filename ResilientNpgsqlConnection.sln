@@ -1,0 +1,24 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ResilientNpgsqlConnection", "ResilientNpgsqlConnection\ResilientNpgsqlConnection.csproj", "{E3594737-961A-43FB-BEA1-0DD353CF476C}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "_Info", "_Info", "{4D7215FE-1FCA-4142-92EB-8247E88DBE93}"
+	ProjectSection(SolutionItems) = preProject
+		.gitignore = .gitignore
+		global.json = global.json
+		LICENSE = LICENSE
+		README.md = README.md
+	EndProjectSection
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{E3594737-961A-43FB-BEA1-0DD353CF476C}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{E3594737-961A-43FB-BEA1-0DD353CF476C}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{E3594737-961A-43FB-BEA1-0DD353CF476C}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{E3594737-961A-43FB-BEA1-0DD353CF476C}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+EndGlobal

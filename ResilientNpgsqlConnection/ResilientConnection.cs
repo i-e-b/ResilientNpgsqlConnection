@@ -1,0 +1,635 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Data;
+using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
+using System.IO;
+using System.Linq;
+using System.Net.Sockets;
+using System.Threading;
+using Npgsql;
+
+namespace ResilientNpgsqlConnection;
+
+/// <summary>
+/// A wrapper for Npgsql database connections.
+/// This adds retry logic for transient failures,
+/// and logging for SQL syntax and schema errors.
+/// </summary>
+public class ResilientConnection:IDbConnection
+{
+    /// <summary>
+    /// Logging injector
+    /// </summary>
+    // ReSharper disable once FieldCanBeMadeReadOnly.Global
+    // ReSharper disable once MemberCanBePrivate.Global
+    public static ILogProvider Log = new ConsoleLogProvider();
+    
+    /// <summary>
+    /// Connection string used for queries and commands
+    /// </summary>
+    public string ConnectionString { get; set; }
+    
+    /// <summary>
+    /// Timeout used for sql queries and commands
+    /// </summary>
+    public int ConnectionTimeout { get; }
+    
+    /// <summary>
+    /// Name of the database being targeted
+    /// </summary>
+    public string? Database { get; private set; }
+    
+    /// <summary>
+    /// Current connection state. This is managed automatically.
+    /// </summary>
+    public ConnectionState State => _source.State;
+    
+    /// <summary>
+    /// Maximum number of failures before a query is abandoned and and exception raised.
+    /// </summary>
+    public static int MaximumRetryCount { get; set; } = 9;
+    
+    /// <summary> Optional waiting action. Mainly used for testing </summary>
+    private Action<int>? _waitAction;
+    private static readonly Random _random = new();
+    
+    private NpgsqlConnection _source;
+    private bool _didDispose;
+    /// <summary> Set to true if an open has ever worked. Used to detect invalid connection strings vs need to purge </summary>
+    private bool _hasEverOpened;
+    
+    private readonly object _lock = new();
+    private readonly List<RcCommandWrapper> _createdCommands;
+
+    /// <summary>
+    /// Wrap an existing Npgsql connection.
+    /// <p/>
+    /// <b>Note:</b> If the original connection string does not contain
+    /// <c>Persist Security Info=true</c>, then connections may not re-establish correctly.
+    /// </summary>
+    public ResilientConnection(NpgsqlConnection source)
+    {
+        _didDispose = false;
+        _source = source;
+        _createdCommands = new List<RcCommandWrapper>();
+        ConnectionString = source.ConnectionString ?? throw new Exception("source connection does not hold a connection string");
+        ConnectionTimeout = source.ConnectionTimeout;
+        Database = source.Database;
+    }
+    
+    /// <summary>
+    /// Create a new connection using a connection string
+    /// </summary>
+    public ResilientConnection(string connectionString)
+    {
+        _didDispose = false;
+        _source = new NpgsqlConnection(connectionString);
+        _createdCommands = new List<RcCommandWrapper>();
+        ConnectionString = connectionString; // note: Npgsql may trim off the password if the connection has ever opened, so we store our own copy here.
+        ConnectionTimeout = _source.ConnectionTimeout;
+        Database = _source.Database;
+    }
+
+    /// <summary>
+    /// Remove instance via GC
+    /// </summary>
+    ~ResilientConnection()
+    {
+        try
+        {
+            Dispose();
+        }
+        catch
+        {
+            // Ignore
+        }
+    }
+
+    /// <summary>Dispose of underlying database connection, and any associated commands</summary>
+    public void Dispose()
+    {
+        // ReSharper disable ConditionIsAlwaysTrueOrFalseAccordingToNullableAPIContract
+        if (_lock is null || _source is null) return;
+        // ReSharper restore ConditionIsAlwaysTrueOrFalseAccordingToNullableAPIContract
+        lock (_lock)
+        {
+            if (_didDispose) return;
+            try
+            {
+                _source.Close();
+                _source.Dispose();
+            }
+            catch (Exception ex)
+            {
+                Log.Warn("Error during dispose", ex);
+            }
+
+            // ReSharper disable once ConditionIsAlwaysTrueOrFalseAccordingToNullableAPIContract
+            if (_createdCommands is not null) // this can go null in some weird edge cases
+            {
+                foreach (var cmd in _createdCommands)
+                {
+                    try
+                    {
+                        if (cmd is null) continue;
+                        cmd.Dispose();
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.Warn("Error during dispose", ex);
+                    }
+                }
+
+                _createdCommands.Clear();
+            }
+
+            _didDispose = true;
+            GC.SuppressFinalize(this);
+        }
+    }
+
+    /// <summary>
+    /// Not supported
+    /// </summary>
+    public IDbTransaction BeginTransaction() => BeginTransaction(IsolationLevel.Unspecified);
+
+    /// <summary>
+    /// Not supported
+    /// </summary>
+    public IDbTransaction BeginTransaction(IsolationLevel il)
+    {
+        throw new NotSupportedException($"Transactions not supported in {nameof(ResilientConnection)}");
+    }
+
+    /// <summary>Changes the current database for an open <see langword="Connection" /> object.</summary>
+    /// <param name="databaseName">The name of the database to use in place of the current database.</param>
+    public void ChangeDatabase(string databaseName)
+    {
+        _source.ChangeDatabase(databaseName);
+        Database = databaseName;
+    }
+
+    /// <inheritdoc />
+    public void Open()
+    {
+        var originalCaller = new StackTrace();
+        Retry(() => {
+            if (_source.State != ConnectionState.Open) _source.Open();
+            _hasEverOpened = true;
+        }, "<open connection>", originalCaller);
+    }
+
+    /// <inheritdoc />
+    public void Close() {
+        if (_source.State != ConnectionState.Closed) _source.Close();
+    }
+
+    /// <summary>
+    /// Creates and returns a Command object associated with the connection.
+    /// This will include a retry- and reconnect- wrapper.
+    /// </summary>
+    public IDbCommand CreateCommand()
+    {
+        var cmd = new RcCommandWrapper(this);
+        _createdCommands.Add(cmd);
+        return cmd;
+    }
+    
+    /// <summary>
+    /// Returns true for codes that mean the exception can be safely retried
+    /// (that is, we know no changes occurred)
+    /// </summary>
+    public static RetryType CanBeRetried(NpgsqlException ex)
+    {
+        var sqlState = (ex as PostgresException)?.SqlState;
+        var hResult = (uint)ex.HResult;
+
+        if (sqlState == PostgresErrorCodes.SyntaxError ||
+            sqlState == PostgresErrorCodes.InvalidSchemaName ||
+            IsSyntaxErrorClass(sqlState))
+        {
+            return RetryType.CriticalFailure;
+        }
+
+        if ((sqlState is null && ex.InnerException is SocketException) ||
+            
+            sqlState == PostgresErrorCodes.AdminShutdown ||
+            sqlState == PostgresErrorCodes.CrashShutdown ||
+            sqlState == PostgresErrorCodes.CannotConnectNow ||
+            sqlState == PostgresErrorCodes.SqlServerRejectedEstablishmentOfSqlConnection ||
+            sqlState == PostgresErrorCodes.SqlClientUnableToEstablishSqlConnection ||
+            sqlState == PostgresErrorCodes.ConnectionFailure || 
+            sqlState == PostgresErrorCodes.ConnectionException
+           ) // likely a fault took the server down. Clear Npgsql pool
+        {
+            NpgsqlConnection.ClearAllPools();
+            return RetryType.CanBeRetried;
+        }
+        
+        if (sqlState == PostgresErrorCodes.InvalidPassword ||
+            sqlState == PostgresErrorCodes.InvalidAuthorizationSpecification ||
+            (hResult == 0x80004005u && MatchesOneOf(ex.Message, "No password has been provided", "remote wall time is too far ahead")))
+        {
+            return RetryType.PurgeAndRetry;
+        }
+
+        if (ex.IsTransient) return RetryType.CanBeRetried;
+        
+        if (ex.InnerException is EndOfStreamException) return RetryType.CanBeRetried;
+        
+        // Transactions and conflicts
+        var canRetry =
+            sqlState == PostgresErrorCodes.TransactionRollback ||
+            sqlState == PostgresErrorCodes.TransactionIntegrityConstraintViolation ||
+            sqlState == PostgresErrorCodes.SerializationFailure ||
+            sqlState == PostgresErrorCodes.StatementCompletionUnknown ||
+            sqlState == PostgresErrorCodes.DeadlockDetected ||
+            // Admin intervention or server maintenance
+            sqlState == PostgresErrorCodes.QueryCanceled ||
+            sqlState == PostgresErrorCodes.OperatorIntervention ||
+            sqlState == PostgresErrorCodes.AdminShutdown ||
+            sqlState == PostgresErrorCodes.CrashShutdown ||
+            sqlState == PostgresErrorCodes.CannotConnectNow ||
+            // Transient overload
+            sqlState == PostgresErrorCodes.TooManyConnections ||
+            hResult == 0x80004005u ||
+            ex.Message?.Contains("restart transaction") == true;
+        
+        return canRetry ? RetryType.CanBeRetried : RetryType.DoNotRetry;
+    }
+
+    private static bool MatchesOneOf(string? message, params string[] matches) => message is not null && matches.Any(message.Contains);
+
+    /// <summary>
+    /// Returns true if the SqlState string matches the Syntax Error class
+    /// (see <see cref="Npgsql.PostgresErrorCodes"/>)
+    /// </summary>
+    private static bool IsSyntaxErrorClass(string? sqlState)
+    {
+        // See Npgsql.PostgresErrorCodes
+        if (sqlState is null) return false;
+        return sqlState.Length == 5 && sqlState.StartsWith("42");
+    }
+
+    /// <summary>
+    /// Get the underlying NpgsqlConnection.
+    /// If the connection is closed, it will be opened.
+    /// If the connection is broken, it will be recreated.
+    /// </summary>
+    /// <returns></returns>
+    public NpgsqlConnection GetRealConnection()
+    {
+        lock (_lock)
+        {
+            _source = RecreateAndOpenIfNeeded(_source);
+            return _source;
+        }
+    }
+
+    /// <summary>
+    /// Replace the default wait (Thread.Sleep) with another action.
+    /// If called with <c>null</c>, the default wait is restored.
+    /// </summary>
+    [SuppressMessage("ReSharper", "UnusedMember.Global")]
+    public void SetWaiter(Action<int>? waitAction)
+    {
+        _waitAction = waitAction;
+    }
+
+    /// <summary>
+    /// Don't call this directly. Use <see cref="GetRealConnection"/>
+    /// </summary>
+    private NpgsqlConnection RecreateAndOpenIfNeeded(NpgsqlConnection oldConnection)
+    {
+        if (oldConnection.State == ConnectionState.Open) return oldConnection; // should be fine
+
+        try
+        {
+            // See if it's just not opened yet
+            oldConnection.Open();
+            _hasEverOpened = true;
+            return oldConnection;
+        }
+        catch
+        {
+            oldConnection.Dispose();
+            var newConnection = new NpgsqlConnection(ConnectionString);
+            newConnection.Open();
+            _hasEverOpened = true;
+            return newConnection;
+        }
+    }
+
+    /// <summary>
+    /// Sleep the current thread, with a scattered exponential wait time,
+    /// based on the number of failed attempts so far
+    /// </summary>
+    private void BackoffWait(int attempts)
+    {
+        /*
+round 0, 101..200
+round 1, 201..300
+round 2, 401..500
+round 3, 801..900
+round 4, 1601..1700
+round 5, 3201..3300
+round 6, 6401..6500
+round 7, 12801..12900
+round 8, 25601..25700*/
+        if (attempts > 8) // stop growing here
+        {
+            Thread.Sleep(30_000 + _random.Next(30_000));
+            return;
+        }
+
+        var sleepDuration = Math.Pow(2, attempts) * 100 + _random.Next(99) + 1;
+        if (_waitAction is null) { Thread.Sleep((int)sleepDuration); }
+        else { _waitAction((int)sleepDuration); }
+    }
+    
+    /// <summary>
+    /// Retry an action (with no return value)
+    /// based on the configured retry count and wait process.
+    /// </summary>
+    private void Retry(Action action, string? queryString, StackTrace originalCaller)
+    {
+        Retry(()=>{
+            action();
+            return 1;
+        }, queryString, originalCaller);
+    }
+
+    /// <summary>
+    /// Retry a function, returning the value of the first successful call,
+    /// based on the configured retry count and wait process.
+    /// </summary>
+    private T Retry<T>(Func<T> func, string? queryString, StackTrace originalCaller) {
+        var lastException = new Exception("Unexpected state");
+        for (int i = 0; i < MaximumRetryCount; i++)
+        {
+            try
+            {
+                var result = func();
+                return result;
+            }
+            catch (NpgsqlException ex) // which includes `PostgresException` and `NpgsqlOperationInProgressException`
+            {
+                lastException = ex;
+
+                if (ex.InnerException is ObjectDisposedException)
+                {
+                    Log.Warn($"{nameof(ResilientConnection)} - Internal error occurred on connection to '{Database}', but can be retried 0x{ex.ErrorCode:X}; from {originalCaller}", ex);
+                    RecreateConnection();
+                }
+
+                var errorType = CanBeRetried(ex);
+                switch (errorType)
+                {
+                    case RetryType.CanBeRetried:
+                        Log.Warn($"{nameof(ResilientConnection)} - SQL error occurred on '{Database}', but can be retried 0x{ex.ErrorCode:X}; from {originalCaller}", ex);
+                        break;
+                    
+                    case RetryType.PurgeAndRetry:
+                        if (_hasEverOpened)
+                        {
+                            Log.Warn($"{nameof(ResilientConnection)} - SQL error occurred on '{Database}', but can be retried 0x{ex.ErrorCode:X} after connection purge; from {originalCaller}", ex);
+                            NpgsqlConnection.ClearAllPools();
+                        }
+                        else
+                        {
+                            Log.Critical($"{nameof(ResilientConnection)} - Connection string might be invalid; from {originalCaller}", ex);
+                        }
+
+                        break;
+                    
+                    case RetryType.CriticalFailure:
+                    {
+                        if (queryString is null || string.IsNullOrWhiteSpace(queryString))
+                        {
+                            Log.Critical($"{nameof(ResilientConnection)} - An invalid query was run against '{Database}' from {originalCaller}", ex);
+                        }
+                        else
+                        {
+                            Log.Critical($"{nameof(ResilientConnection)} - An invalid query was run against '{Database}' from {originalCaller}:\r\n\r\n    {queryString.Replace("\n", "    \n")}\r\n", ex);
+                        }
+
+                        throw;
+                    }
+                    
+                    case RetryType.DoNotRetry:
+                    default:
+                        Log.Error($"{nameof(ResilientConnection)} - Non retry error on '{Database}': 0x{ex.ErrorCode:X}; from {originalCaller}", ex);
+                        throw new Exception($"{nameof(ResilientConnection)} - SQL error on '{Database}'. Code = 0x{ex.ErrorCode:X}. From {originalCaller}", ex);
+                }
+            }
+            catch (TimeoutException tex)
+            {
+                Log.Warn($"{nameof(ResilientConnection)} - Timeout error occurred on '{Database}'; from {originalCaller}", tex);
+            }
+            catch (SocketException sockEx)
+            {
+                // This happens if there is a network issue between client and the SQL server.
+                // Retry and hope it is resolved
+                Log.Warn($"{nameof(ResilientConnection)} - Network error occurred on '{Database}', but can be retried {sockEx.Message}; from {originalCaller}", sockEx);
+                RecreateConnection();
+            }
+            catch (InvalidOperationException ioEx)
+            {
+                // This happens if the connection state is messed up.
+                // Retry and hope it settles down
+                Log.Warn($"{nameof(ResilientConnection)} - Operation error occurred on '{Database}', but can be retried {ioEx.Message}; from {originalCaller}", ioEx);
+            }
+            catch (Exception oex)
+            {
+                if (LooksLikeNetworkFault(oex))
+                {
+                    Log.Warn($"{nameof(ResilientConnection)} - Suspected network error occurred on '{Database}', but can be retried; from {originalCaller}", oex);
+                }
+                else
+                {
+                    throw new Exception($"Unexpected error in {nameof(ResilientConnection)}. Type='{oex.GetType()?.Name}'. From {originalCaller}", oex);
+                }
+            }
+
+            BackoffWait(i);
+        } // for (int i = 0; i < MaximumRetryCount; i++)
+        
+        throw new Exception($"{nameof(ResilientConnection)} - SQL failed on '{Database}' after maximum retries ({MaximumRetryCount}) attempted. From {originalCaller}", lastException);
+    }
+
+    /// <summary>
+    /// Second chance to detect network faults.
+    /// This should be caught by <c>catch (SocketException sockEx)</c>
+    /// </summary>
+    private static bool LooksLikeNetworkFault(Exception ex)
+    {
+        if (ex.GetType()?.Name == "System.Net.Internals.SocketExceptionFactory+ExtendedSocketException") return true;
+        if (ex.Message?.Contains("Resource temporarily unavailable") == true) return true;
+        return false;
+    }
+
+    /// <summary>
+    /// Dispose of old connection and create a new one
+    /// </summary>
+    private void RecreateConnection()
+    {
+        lock (_lock)
+        {
+            var oldConnection = _source;
+            _source = new NpgsqlConnection(ConnectionString);
+            try
+            {
+                oldConnection.Dispose();
+            }
+            catch
+            {
+                // ignore
+            }
+        }
+    }
+
+    /// <summary>
+    /// Retry and reconnection wrapper for database commands
+    /// </summary>
+    private class RcCommandWrapper : IDbCommand
+    {
+        private readonly ResilientConnection _parent;
+        private readonly NpgsqlCommand _dummy;
+        /// <summary>List of 'inner' commands we've generated. We will dispose of these at our dispose time</summary>
+        private readonly List<NpgsqlCommand> _danglingCommands;
+        private bool _didDispose;
+
+        public string? CommandText {
+            get => _dummy.CommandText;
+            set => _dummy.CommandText = value;
+        }
+        public int CommandTimeout {
+            get => _dummy.CommandTimeout;
+            set => _dummy.CommandTimeout = value;
+        }
+        public CommandType CommandType {
+            get => _dummy.CommandType;
+            set => _dummy.CommandType = value;
+        }
+        public IDbConnection Connection {
+            get => _parent;
+            set => throw new Exception("Resilient command does not support switching connection");
+        }
+        public IDataParameterCollection Parameters { get; }
+        public IDbTransaction? Transaction { get; set; }
+        public UpdateRowSource UpdatedRowSource { get; set; }
+        
+        /// <summary>
+        /// Create a new command wrapper.
+        /// This should NOT be called directly.
+        /// Use <see cref="ResilientConnection.CreateCommand"/> to create a command.
+        /// </summary>
+        public RcCommandWrapper(ResilientConnection parent)
+        {
+            _didDispose = false;
+            _parent = parent;
+            _dummy = new NpgsqlCommand();
+            CommandText = "";
+            Parameters = _dummy.Parameters ?? throw new Exception("NpgsqlCommand gave null parameter collection");
+            _danglingCommands = new();
+        }
+
+        /// <summary>
+        /// Dispose of child objects at garbage collection, if not already disposed.
+        /// </summary>
+        ~RcCommandWrapper()
+        {
+            if (_didDispose) return;
+            Dispose();
+        }
+
+        /// <inheritdoc />
+        public void Dispose()
+        {
+            _didDispose = true;
+            foreach (var cmd in _danglingCommands)
+            {
+                try
+                {
+                    if (cmd is null) continue;
+                    cmd.Dispose();
+                }
+                catch (Exception ex)
+                {
+                    Log.Warn("Error during dispose", ex);
+                }
+            }
+            _dummy.Dispose();
+            _danglingCommands.Clear();
+
+            GC.SuppressFinalize(this);
+        }
+
+        /// <inheritdoc />
+        public void Cancel()
+        {
+            foreach (var cmd in _danglingCommands)
+            {
+                cmd.Cancel();
+            }
+        }
+
+        /// <summary>
+        /// For most purposes, use <c>"AddParameter"</c> or <c>"AddArrayParameter"</c> instead of this.
+        /// Creates a new instance of an <see cref="T:System.Data.IDbDataParameter" /> object.
+        /// </summary>
+        public IDbDataParameter CreateParameter() => _dummy.CreateParameter() ?? throw new Exception("Failed to create parameter from base connection");
+
+        /// <inheritdoc />
+        public IDataReader? ExecuteReader() => ExecuteReader(CommandBehavior.Default);
+
+        /// <inheritdoc />
+        public IDataReader? ExecuteReader(CommandBehavior behavior)
+        {
+            var originalCaller = new StackTrace();
+            return _parent.Retry(()=>ReconnectCommand().ExecuteReader(behavior), CommandText, originalCaller);
+        }
+
+        /// <inheritdoc />
+        public object? ExecuteScalar()
+        {
+            var originalCaller = new StackTrace();
+            return _parent.Retry(()=>ReconnectCommand().ExecuteScalar(), CommandText, originalCaller);
+        }
+        
+        /// <inheritdoc />
+        public int ExecuteNonQuery()
+        {
+            var originalCaller = new StackTrace();
+            return _parent.Retry(()=>ReconnectCommand().ExecuteNonQuery(), CommandText, originalCaller);
+        }
+
+        /// <inheritdoc />
+        public void Prepare()
+        {
+            throw new NotImplementedException("Prepared commands are not supported by the ResilientConnection adaptor");
+        }
+
+        /// <summary>
+        /// Start a real command, copy details over from dummy. Re-connect and retry as needed.
+        /// </summary>
+        /// <returns></returns>
+        private NpgsqlCommand ReconnectCommand()
+        {
+            var conn = _parent.GetRealConnection();
+            var cmd = conn.CreateCommand() ?? throw new Exception("Failed to create command from base connection");
+            _danglingCommands.Add(cmd);
+            
+            cmd.CommandType = CommandType;
+            cmd.CommandText = CommandText;
+            
+            var plist = _dummy.Parameters?.ToArray() ?? Array.Empty<NpgsqlParameter>();
+            foreach (var p in plist)
+            {
+                cmd.Parameters?.Add(p.Clone()!);
+            }
+            return cmd;
+        }
+    }
+}
