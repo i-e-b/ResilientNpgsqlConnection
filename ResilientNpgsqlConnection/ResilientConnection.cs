@@ -1,12 +1,13 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Data;
+using System.Data.Common;
 using System.Diagnostics;
-using System.Diagnostics.CodeAnalysis;
 using System.IO;
 using System.Linq;
 using System.Net.Sockets;
 using System.Threading;
+using System.Threading.Tasks;
 using Npgsql;
 
 namespace ResilientNpgsqlConnection;
@@ -16,7 +17,7 @@ namespace ResilientNpgsqlConnection;
 /// This adds retry logic for transient failures,
 /// and logging for SQL syntax and schema errors.
 /// </summary>
-public class ResilientConnection:IDbConnection
+public class ResilientConnection: DbConnection
 {
     /// <summary>
     /// Logging injector
@@ -24,26 +25,45 @@ public class ResilientConnection:IDbConnection
     // ReSharper disable once FieldCanBeMadeReadOnly.Global
     // ReSharper disable once MemberCanBePrivate.Global
     public static ILogProvider Log = new ConsoleLogProvider();
-    
+
+    /// <summary>
+    /// If set to <c>true</c>, retries will be skipped.
+    /// </summary>
+    public static bool TestMode { get; set; }
+
     /// <summary>
     /// Connection string used for queries and commands
     /// </summary>
-    public string ConnectionString { get; set; }
-    
+    public override string ConnectionString
+    {
+        get => _connectionString;
+        set => _connectionString = value;
+    }
+
     /// <summary>
     /// Timeout used for sql queries and commands
     /// </summary>
-    public int ConnectionTimeout { get; }
-    
+    public override int ConnectionTimeout { get; }
+
     /// <summary>
     /// Name of the database being targeted
     /// </summary>
-    public string? Database { get; private set; }
-    
+    public override string Database => _database;
+
+    /// <summary>
+    /// The name of the database server to which to connect. The default value is an empty string.
+    /// </summary>
+    public override string DataSource => "";
+
+    /// <summary>
+    /// The version of the database. The default value is an empty string.
+    /// </summary>
+    public override string ServerVersion => "";
+
     /// <summary>
     /// Current connection state. This is managed automatically.
     /// </summary>
-    public ConnectionState State => _source.State;
+    public override ConnectionState State => _source.State;
     
     /// <summary>
     /// Maximum number of failures before a query is abandoned and and exception raised.
@@ -52,6 +72,8 @@ public class ResilientConnection:IDbConnection
     
     /// <summary> Optional waiting action. Mainly used for testing </summary>
     private Action<int>? _waitAction;
+    private static long _totalFailureCount;
+    private static long _totalSuccessCount;
     private static readonly Random _random = new();
     
     private NpgsqlConnection _source;
@@ -61,6 +83,21 @@ public class ResilientConnection:IDbConnection
     
     private readonly object _lock = new();
     private readonly List<RcCommandWrapper> _createdCommands;
+    private string _database;
+    private string _connectionString;
+
+
+    /// <summary>
+    /// Total number of database calls that have failed across all connections.
+    /// This will include retries that also failed.
+    /// </summary>
+    public static long TotalFailures => _totalFailureCount;
+        
+    /// <summary>
+    /// Total number of database calls that have succeeded across all connections.
+    /// This will include successful retries after a failure.
+    /// </summary>
+    public static long TotalSuccesses => _totalSuccessCount;
 
     /// <summary>
     /// Wrap an existing Npgsql connection.
@@ -73,9 +110,9 @@ public class ResilientConnection:IDbConnection
         _didDispose = false;
         _source = source;
         _createdCommands = new List<RcCommandWrapper>();
-        ConnectionString = source.ConnectionString ?? throw new Exception("source connection does not hold a connection string");
+        _connectionString = source.ConnectionString ?? throw new Exception("source connection does not hold a connection string");
         ConnectionTimeout = source.ConnectionTimeout;
-        Database = source.Database;
+        _database = source.Database;
     }
     
     /// <summary>
@@ -86,9 +123,9 @@ public class ResilientConnection:IDbConnection
         _didDispose = false;
         _source = new NpgsqlConnection(connectionString);
         _createdCommands = new List<RcCommandWrapper>();
-        ConnectionString = connectionString; // note: Npgsql may trim off the password if the connection has ever opened, so we store our own copy here.
+        _connectionString = connectionString; // note: Npgsql may trim off the password if the connection has ever opened, so we store our own copy here.
         ConnectionTimeout = _source.ConnectionTimeout;
-        Database = _source.Database;
+        _database = _source.Database;
     }
 
     /// <summary>
@@ -96,18 +133,11 @@ public class ResilientConnection:IDbConnection
     /// </summary>
     ~ResilientConnection()
     {
-        try
-        {
-            Dispose();
-        }
-        catch
-        {
-            // Ignore
-        }
+        Dispose(false);
     }
 
     /// <summary>Dispose of underlying database connection, and any associated commands</summary>
-    public void Dispose()
+    protected override void Dispose(bool disposing)
     {
         // ReSharper disable ConditionIsAlwaysTrueOrFalseAccordingToNullableAPIContract
         if (_lock is null || _source is null) return;
@@ -122,7 +152,7 @@ public class ResilientConnection:IDbConnection
             }
             catch (Exception ex)
             {
-                Log.Warn("Error during dispose", ex);
+                Log.Warn("Error during dispose: ", ex);
             }
 
             // ReSharper disable once ConditionIsAlwaysTrueOrFalseAccordingToNullableAPIContract
@@ -137,7 +167,7 @@ public class ResilientConnection:IDbConnection
                     }
                     catch (Exception ex)
                     {
-                        Log.Warn("Error during dispose", ex);
+                        Log.Warn("Error during dispose: ", ex);
                     }
                 }
 
@@ -150,28 +180,23 @@ public class ResilientConnection:IDbConnection
     }
 
     /// <summary>
-    /// Not supported
+    /// Not supported.
     /// </summary>
-    public IDbTransaction BeginTransaction() => BeginTransaction(IsolationLevel.Unspecified);
-
-    /// <summary>
-    /// Not supported
-    /// </summary>
-    public IDbTransaction BeginTransaction(IsolationLevel il)
+    protected override DbTransaction BeginDbTransaction(IsolationLevel isolationLevel)
     {
-        throw new NotSupportedException($"Transactions not supported in {nameof(ResilientConnection)}");
+        throw new NotSupportedException($"Transactions not supported in {nameof(ResilientConnection)}.");
     }
 
     /// <summary>Changes the current database for an open <see langword="Connection" /> object.</summary>
     /// <param name="databaseName">The name of the database to use in place of the current database.</param>
-    public void ChangeDatabase(string databaseName)
+    public override void ChangeDatabase(string databaseName)
     {
         _source.ChangeDatabase(databaseName);
-        Database = databaseName;
+        _database = databaseName;
     }
 
     /// <inheritdoc />
-    public void Open()
+    public override void Open()
     {
         var originalCaller = new StackTrace();
         Retry(() => {
@@ -181,7 +206,7 @@ public class ResilientConnection:IDbConnection
     }
 
     /// <inheritdoc />
-    public void Close() {
+    public override void Close() {
         if (_source.State != ConnectionState.Closed) _source.Close();
     }
 
@@ -189,7 +214,7 @@ public class ResilientConnection:IDbConnection
     /// Creates and returns a Command object associated with the connection.
     /// This will include a retry- and reconnect- wrapper.
     /// </summary>
-    public IDbCommand CreateCommand()
+    protected override DbCommand CreateDbCommand()
     {
         var cmd = new RcCommandWrapper(this);
         _createdCommands.Add(cmd);
@@ -202,6 +227,8 @@ public class ResilientConnection:IDbConnection
     /// </summary>
     public static RetryType CanBeRetried(NpgsqlException ex)
     {
+        if (TestMode) return RetryType.DoNotRetry;
+        
         var sqlState = (ex as PostgresException)?.SqlState;
         var hResult = (uint)ex.HResult;
 
@@ -223,14 +250,14 @@ public class ResilientConnection:IDbConnection
             sqlState == PostgresErrorCodes.ConnectionException
            ) // likely a fault took the server down. Clear Npgsql pool
         {
-            NpgsqlConnection.ClearAllPools();
-            return RetryType.CanBeRetried;
+            return RetryType.PurgeAndRetry;
         }
         
         if (sqlState == PostgresErrorCodes.InvalidPassword ||
             sqlState == PostgresErrorCodes.InvalidAuthorizationSpecification ||
-            (hResult == 0x80004005u && MatchesOneOf(ex.Message, "No password has been provided", "remote wall time is too far ahead")))
+            (hResult == 0x80004005u && MatchesOneOf(ex.Message, "No password has been provided", "remote wall time is too far ahead", "operation \"get-user-session\" timed out")))
         {
+            Log.Warn("Possible CockroachDB cluster fault", ex);
             return RetryType.PurgeAndRetry;
         }
 
@@ -288,10 +315,18 @@ public class ResilientConnection:IDbConnection
     }
 
     /// <summary>
+    /// Reset success and failure counts to zero
+    /// </summary>
+    public static void ResetStatistics()
+    {
+        _totalFailureCount = 0;
+        _totalSuccessCount = 0;
+    }
+
+    /// <summary>
     /// Replace the default wait (Thread.Sleep) with another action.
     /// If called with <c>null</c>, the default wait is restored.
     /// </summary>
-    [SuppressMessage("ReSharper", "UnusedMember.Global")]
     public void SetWaiter(Action<int>? waitAction)
     {
         _waitAction = waitAction;
@@ -366,15 +401,18 @@ round 8, 25601..25700*/
     /// </summary>
     private T Retry<T>(Func<T> func, string? queryString, StackTrace originalCaller) {
         var lastException = new Exception("Unexpected state");
+        
         for (int i = 0; i < MaximumRetryCount; i++)
         {
             try
             {
                 var result = func();
+                Interlocked.Increment(ref _totalSuccessCount);
                 return result;
             }
             catch (NpgsqlException ex) // which includes `PostgresException` and `NpgsqlOperationInProgressException`
             {
+                Interlocked.Increment(ref _totalFailureCount);
                 lastException = ex;
 
                 if (ex.InnerException is ObjectDisposedException)
@@ -391,10 +429,11 @@ round 8, 25601..25700*/
                         break;
                     
                     case RetryType.PurgeAndRetry:
+                        NpgsqlConnection.ClearAllPools();
                         if (_hasEverOpened)
                         {
                             Log.Warn($"{nameof(ResilientConnection)} - SQL error occurred on '{Database}', but can be retried 0x{ex.ErrorCode:X} after connection purge; from {originalCaller}", ex);
-                            NpgsqlConnection.ClearAllPools();
+                            BackoffWait(i); // Extra wait when connection has issues -- might be broken cluster
                         }
                         else
                         {
@@ -405,13 +444,14 @@ round 8, 25601..25700*/
                     
                     case RetryType.CriticalFailure:
                     {
-                        if (queryString is null || string.IsNullOrWhiteSpace(queryString))
+                        if (string.IsNullOrWhiteSpace(queryString))
                         {
                             Log.Critical($"{nameof(ResilientConnection)} - An invalid query was run against '{Database}' from {originalCaller}", ex);
                         }
                         else
                         {
-                            Log.Critical($"{nameof(ResilientConnection)} - An invalid query was run against '{Database}' from {originalCaller}:\r\n\r\n    {queryString.Replace("\n", "    \n")}\r\n", ex);
+                            Log.Critical($"{nameof(ResilientConnection)} - An invalid query was run against '{Database}' from {originalCaller}:" +
+                                         $"\r\n\r\n    {queryString.Replace("\n", "    \n")}\r\n", ex);
                         }
 
                         throw;
@@ -448,6 +488,7 @@ round 8, 25601..25700*/
                 }
                 else
                 {
+                    Interlocked.Increment(ref _totalFailureCount);
                     throw new Exception($"Unexpected error in {nameof(ResilientConnection)}. Type='{oex.GetType()?.Name}'. From {originalCaller}", oex);
                 }
             }
@@ -492,7 +533,11 @@ round 8, 25601..25700*/
     /// <summary>
     /// Retry and reconnection wrapper for database commands
     /// </summary>
-    private class RcCommandWrapper : IDbCommand
+    /// <remarks>
+    /// It is much simpler to implement only <see cref="IDbCommand"/>,
+    /// but Dapper requires <see cref="DbCommand"/> for async calls.
+    /// </remarks>
+    private class RcCommandWrapper : DbCommand
     {
         private readonly ResilientConnection _parent;
         private readonly NpgsqlCommand _dummy;
@@ -500,38 +545,38 @@ round 8, 25601..25700*/
         private readonly List<NpgsqlCommand> _danglingCommands;
         private bool _didDispose;
 
-        public string? CommandText {
+        public override string CommandText {
             get => _dummy.CommandText;
             set => _dummy.CommandText = value;
         }
-        public int CommandTimeout {
+        public override int CommandTimeout {
             get => _dummy.CommandTimeout;
             set => _dummy.CommandTimeout = value;
         }
-        public CommandType CommandType {
+        public override CommandType CommandType {
             get => _dummy.CommandType;
             set => _dummy.CommandType = value;
         }
-        public IDbConnection Connection {
+        protected override DbConnection? DbConnection {
             get => _parent;
             set => throw new Exception("Resilient command does not support switching connection");
         }
-        public IDataParameterCollection Parameters { get; }
-        public IDbTransaction? Transaction { get; set; }
-        public UpdateRowSource UpdatedRowSource { get; set; }
+        protected override DbParameterCollection DbParameterCollection { get; }
+        protected override DbTransaction? DbTransaction { get; set; }
+        public override bool DesignTimeVisible { get; set; }
+        public override UpdateRowSource UpdatedRowSource { get; set; }
         
         /// <summary>
         /// Create a new command wrapper.
         /// This should NOT be called directly.
-        /// Use <see cref="ResilientConnection.CreateCommand"/> to create a command.
+        /// Use <see cref="DbConnection.CreateCommand"/> to create a command.
         /// </summary>
         public RcCommandWrapper(ResilientConnection parent)
         {
             _didDispose = false;
             _parent = parent;
             _dummy = new NpgsqlCommand();
-            CommandText = "";
-            Parameters = _dummy.Parameters ?? throw new Exception("NpgsqlCommand gave null parameter collection");
+            DbParameterCollection = _dummy.Parameters;
             _danglingCommands = new();
         }
 
@@ -545,7 +590,7 @@ round 8, 25601..25700*/
         }
 
         /// <inheritdoc />
-        public void Dispose()
+        protected override void Dispose(bool disposing)
         {
             _didDispose = true;
             foreach (var cmd in _danglingCommands)
@@ -557,7 +602,7 @@ round 8, 25601..25700*/
                 }
                 catch (Exception ex)
                 {
-                    Log.Warn("Error during dispose", ex);
+                    Log.Warn("Error during dispose: ", ex);
                 }
             }
             _dummy.Dispose();
@@ -567,7 +612,7 @@ round 8, 25601..25700*/
         }
 
         /// <inheritdoc />
-        public void Cancel()
+        public override void Cancel()
         {
             foreach (var cmd in _danglingCommands)
             {
@@ -579,34 +624,76 @@ round 8, 25601..25700*/
         /// For most purposes, use <c>"AddParameter"</c> or <c>"AddArrayParameter"</c> instead of this.
         /// Creates a new instance of an <see cref="T:System.Data.IDbDataParameter" /> object.
         /// </summary>
-        public IDbDataParameter CreateParameter() => _dummy.CreateParameter() ?? throw new Exception("Failed to create parameter from base connection");
+        protected override DbParameter CreateDbParameter() => _dummy.CreateParameter();
 
         /// <inheritdoc />
-        public IDataReader? ExecuteReader() => ExecuteReader(CommandBehavior.Default);
-
-        /// <inheritdoc />
-        public IDataReader? ExecuteReader(CommandBehavior behavior)
+        protected override Task<DbDataReader> ExecuteDbDataReaderAsync(CommandBehavior behavior, CancellationToken cancellationToken)
         {
             var originalCaller = new StackTrace();
-            return _parent.Retry(()=>ReconnectCommand().ExecuteReader(behavior), CommandText, originalCaller);
+
+            try
+            {
+                var result = _parent.Retry(() => ReconnectCommand().ExecuteReader(behavior), CommandText, originalCaller);
+                return Task.FromResult((DbDataReader)result);
+            }
+            catch (Exception ex)
+            {
+                return Task.FromException<DbDataReader>(ex);
+            }
         }
 
         /// <inheritdoc />
-        public object? ExecuteScalar()
+        protected override DbDataReader ExecuteDbDataReader(CommandBehavior behavior)
+        {
+            var originalCaller = new StackTrace();
+            return _parent.Retry(() => ReconnectCommand().ExecuteReader(behavior), CommandText, originalCaller);
+        }
+        
+        /// <inheritdoc />
+        public override Task<object?> ExecuteScalarAsync(CancellationToken cancellationToken)
+        {
+            var originalCaller = new StackTrace();
+            try
+            {
+                var result = _parent.Retry(()=>ReconnectCommand().ExecuteScalar(), CommandText, originalCaller);
+                return Task.FromResult(result);
+            }
+            catch (Exception ex)
+            {
+                return Task.FromException<object?>(ex);
+            }
+        }
+        
+        /// <inheritdoc />
+        public override object? ExecuteScalar()
         {
             var originalCaller = new StackTrace();
             return _parent.Retry(()=>ReconnectCommand().ExecuteScalar(), CommandText, originalCaller);
         }
         
         /// <inheritdoc />
-        public int ExecuteNonQuery()
+        public override Task<int> ExecuteNonQueryAsync(CancellationToken cancellationToken)
         {
             var originalCaller = new StackTrace();
-            return _parent.Retry(()=>ReconnectCommand().ExecuteNonQuery(), CommandText, originalCaller);
+            try
+            {
+                return Task.FromResult(_parent.Retry(()=>ReconnectCommand().ExecuteNonQuery(), CommandText, originalCaller));
+            }
+            catch (Exception ex)
+            {
+                return Task.FromException<int>(ex);
+            }
         }
 
         /// <inheritdoc />
-        public void Prepare()
+        public override int ExecuteNonQuery()
+        {
+            var originalCaller = new StackTrace();
+            return _parent.Retry(() => ReconnectCommand().ExecuteNonQuery(), CommandText, originalCaller);
+        }
+
+        /// <inheritdoc />
+        public override void Prepare()
         {
             throw new NotImplementedException("Prepared commands are not supported by the ResilientConnection adaptor");
         }
@@ -618,18 +705,32 @@ round 8, 25601..25700*/
         private NpgsqlCommand ReconnectCommand()
         {
             var conn = _parent.GetRealConnection();
-            var cmd = conn.CreateCommand() ?? throw new Exception("Failed to create command from base connection");
+            var cmd = conn.CreateCommand();
             _danglingCommands.Add(cmd);
             
             cmd.CommandType = CommandType;
             cmd.CommandText = CommandText;
             
-            var plist = _dummy.Parameters?.ToArray() ?? Array.Empty<NpgsqlParameter>();
+            var plist = _dummy.Parameters.ToArray();
             foreach (var p in plist)
             {
-                cmd.Parameters?.Add(p.Clone()!);
+                cmd.Parameters.Add(p.Clone());
             }
             return cmd;
         }
+    }
+
+
+    private async ValueTask DisposeAsyncCore()
+    {
+        Dispose(true);
+        await _source.DisposeAsync();
+    }
+
+    /// <inheritdoc />
+    public override async ValueTask DisposeAsync()
+    {
+        await DisposeAsyncCore();
+        GC.SuppressFinalize(this);
     }
 }
